@@ -1,1 +1,1 @@
-﻿numpy>=1.26.0\npandas>=2.2.0\n
+numpy>=1.26.0\npandas>=2.2.0\nscipy>=1.11.0
