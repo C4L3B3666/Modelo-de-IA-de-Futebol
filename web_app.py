@@ -1,7 +1,7 @@
-"""Local browser dashboard for the offline football predictor.
+"""Local browser dashboard for the trained offline football predictor.
 
 Run:
-    python web_app.py
+    .\\venv\\Scripts\\python.exe web_app.py
 
 Then open:
     http://127.0.0.1:8000
@@ -19,27 +19,61 @@ import pandas as pd
 from app import compute_outcome_probabilities, load_match_data
 from models.poisson_model import PoissonGoalModel
 
+try:
+    import joblib
+except ImportError:  # Allows a fallback when running outside the project venv.
+    joblib = None
+
 
 DATA_PATH = Path("data/real_matches.csv")
-MAX_GOALS = 6
+MODEL_PATH = Path("models/artifacts/football_predictor.joblib")
+MAX_GOALS = 8
 DEFAULT_LIMIT = 100
 
 
 class PredictorState:
-    def __init__(self, data_path: Path = DATA_PATH) -> None:
+    """Loads the saved trained model when available, otherwise falls back to Poisson."""
+
+    def __init__(self, data_path: Path = DATA_PATH, model_path: Path = MODEL_PATH) -> None:
         self.data_path = data_path
+        self.model_path = model_path
         self.matches = load_match_data(data_path)
-        self.model = PoissonGoalModel(max_goals=MAX_GOALS)
-        self.model.fit(self.matches)
-        self.teams = sorted(self.model.get_team_strengths().index.tolist())
+        self.metadata: dict = {}
+        self.uses_saved_model = False
+
+        if joblib is not None and model_path.exists():
+            artifact = joblib.load(model_path)
+            self.model = artifact["predictor"]
+            self.metadata = artifact.get("metadata", {})
+            self.uses_saved_model = True
+            training_data = getattr(self.model, "training_data_", self.matches)
+            self.teams = sorted(pd.unique(training_data[["home_team", "away_team"]].values.ravel()))
+        else:
+            self.model = PoissonGoalModel(max_goals=MAX_GOALS)
+            self.model.fit(self.matches)
+            self.teams = sorted(self.model.get_team_strengths().index.tolist())
 
     def predict(self, home_team: str, away_team: str) -> dict:
+        if self.uses_saved_model:
+            prediction = self.model.predict(home_team, away_team, top_n=8)
+            return {
+                "home_expected": prediction["expected_goals"]["home"],
+                "away_expected": prediction["expected_goals"]["away"],
+                "outcomes": prediction["probabilities"],
+                "scores": pd.DataFrame(prediction["top_scores"]),
+            }
+
         home_expected, away_expected = self.model.predict_expected_goals(home_team, away_team)
         scores = self.model.predict_score_probabilities(home_team, away_team, max_goals=MAX_GOALS)
+        outcomes = compute_outcome_probabilities(scores)
         return {
             "home_expected": home_expected,
             "away_expected": away_expected,
-            "outcomes": compute_outcome_probabilities(scores),
+            "outcomes": {
+                "home_win": outcomes["Vitória casa"],
+                "draw": outcomes["Empate"],
+                "away_win": outcomes["Vitória fora"],
+            },
             "scores": scores.head(8),
         }
 
@@ -56,7 +90,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         query = parse_qs(parsed.query)
         home_team = query.get("home_team", [STATE.teams[0]])[0]
-        away_team = query.get("away_team", [STATE.teams[1] if len(STATE.teams) > 1 else STATE.teams[0]])[0]
+        away_default = STATE.teams[1] if len(STATE.teams) > 1 else STATE.teams[0]
+        away_team = query.get("away_team", [away_default])[0]
         limit = parse_limit(query.get("limit", [str(DEFAULT_LIMIT)])[0])
 
         html = render_dashboard(home_team, away_team, limit)
@@ -80,10 +115,8 @@ def parse_limit(value: str) -> int:
 
 
 def render_dashboard(home_team: str, away_team: str, limit: int) -> str:
-    prediction_html = render_prediction(home_team, away_team)
     teams_options_home = render_team_options(home_team)
     teams_options_away = render_team_options(away_team)
-    matches_html = render_matches_table(limit)
     total_matches = len(STATE.matches)
     shown_matches = total_matches if limit == 0 else min(limit, total_matches)
 
@@ -103,7 +136,6 @@ def render_dashboard(home_team: str, away_team: str, limit: int) -> str:
       --line: #d8dee6;
       --accent: #0b6bcb;
       --accent-dark: #064f99;
-      --good: #0b7a53;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -182,12 +214,10 @@ def render_dashboard(home_team: str, away_team: str, limit: int) -> str:
   </style>
 </head>
 <body>
-  <header>
-    <h1>Football AI Model</h1>
-  </header>
+  <header><h1>Football AI Model</h1></header>
   <main>
     <section>
-      <h2>Previsão</h2>
+      <h2>Previsao</h2>
       <form method="get" action="/">
         <label>Casa<select name="home_team">{teams_options_home}</select></label>
         <label>Fora<select name="away_team">{teams_options_away}</select></label>
@@ -195,15 +225,38 @@ def render_dashboard(home_team: str, away_team: str, limit: int) -> str:
         <button type="submit">Atualizar</button>
       </form>
     </section>
-    {prediction_html}
+    {render_model_status()}
+    {render_prediction(home_team, away_team)}
     <section>
       <h2>Jogos no CSV</h2>
       <p class="muted">Mostrando {shown_matches} de {total_matches} jogos. Use 0 no campo Jogos para mostrar todos.</p>
-      {matches_html}
+      {render_matches_table(limit)}
     </section>
   </main>
 </body>
 </html>"""
+
+
+def render_model_status() -> str:
+    if not STATE.uses_saved_model:
+        return """<section>
+  <h2>Modelo</h2>
+  <p class="muted">Usando Poisson treinado ao abrir a pagina. Rode scripts/train_model.py para usar o modelo salvo.</p>
+</section>"""
+
+    metadata = STATE.metadata
+    backtest = metadata.get("backtest", {})
+    return f"""<section>
+  <h2>Modelo treinado</h2>
+  <div class="metrics">
+    <div class="metric"><span>Tipo</span><strong>{escape(str(metadata.get("model_type", "-")))}</strong></div>
+    <div class="metric"><span>Jogos</span><strong>{metadata.get("matches", "-")}</strong></div>
+    <div class="metric"><span>Times</span><strong>{metadata.get("teams", "-")}</strong></div>
+    <div class="metric"><span>Accuracy</span><strong>{format_pct(float(backtest.get("accuracy", 0.0)))}</strong></div>
+    <div class="metric"><span>ROI teste</span><strong>{format_pct(float(backtest.get("roi", 0.0)))}</strong></div>
+  </div>
+  <p class="muted">Periodo treinado: {escape(str(metadata.get("first_date", "-")))} ate {escape(str(metadata.get("last_date", "-")))}.</p>
+</section>"""
 
 
 def render_prediction(home_team: str, away_team: str) -> str:
@@ -213,22 +266,21 @@ def render_prediction(home_team: str, away_team: str) -> str:
         return f"<section><h2>Erro</h2><p>{escape(str(exc))}</p></section>"
 
     outcomes = prediction["outcomes"]
-    scores = prediction["scores"]
     score_rows = "\n".join(
         "<tr>"
         f"<td>{int(row.home_goals)}-{int(row.away_goals)}</td>"
-        f"<td>{format_pct(row.probability)}</td>"
+        f"<td>{format_pct(float(row.probability))}</td>"
         "</tr>"
-        for row in scores.itertuples()
+        for row in prediction["scores"].itertuples()
     )
     return f"""<section>
   <h2>{escape(home_team)} x {escape(away_team)}</h2>
   <div class="metrics">
-    <div class="metric"><span>xG casa</span><strong>{prediction['home_expected']:.2f}</strong></div>
-    <div class="metric"><span>xG fora</span><strong>{prediction['away_expected']:.2f}</strong></div>
-    <div class="metric"><span>Casa</span><strong>{format_pct(outcomes['Vitória casa'])}</strong></div>
-    <div class="metric"><span>Empate</span><strong>{format_pct(outcomes['Empate'])}</strong></div>
-    <div class="metric"><span>Fora</span><strong>{format_pct(outcomes['Vitória fora'])}</strong></div>
+    <div class="metric"><span>xG casa</span><strong>{prediction["home_expected"]:.2f}</strong></div>
+    <div class="metric"><span>xG fora</span><strong>{prediction["away_expected"]:.2f}</strong></div>
+    <div class="metric"><span>Casa</span><strong>{format_pct(float(outcomes["home_win"]))}</strong></div>
+    <div class="metric"><span>Empate</span><strong>{format_pct(float(outcomes["draw"]))}</strong></div>
+    <div class="metric"><span>Fora</span><strong>{format_pct(float(outcomes["away_win"]))}</strong></div>
   </div>
   <div class="table-wrap">
     <table>
@@ -285,7 +337,7 @@ def main() -> int:
     host = "127.0.0.1"
     port = 8000
     server = ThreadingHTTPServer((host, port), DashboardHandler)
-    print(f"Dashboard disponível em http://{host}:{port}")
+    print(f"Dashboard disponivel em http://{host}:{port}")
     server.serve_forever()
     return 0
 
