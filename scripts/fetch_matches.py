@@ -69,10 +69,14 @@ def get_api_key(cli_key: Optional[str]) -> str:
     if cli_key:
         return cli_key
 
-    api_key = os.getenv("API_FOOTBALL_KEY") or os.getenv("APISPORTS_KEY")
+    api_key = (
+        os.getenv("API_FOOTBALL_KEY")
+        or os.getenv("APISPORTS_KEY")
+        or os.getenv("FOOTBALL_API_KEY")
+    )
     if not api_key:
         raise RuntimeError(
-            "API key not found. Set API_FOOTBALL_KEY or APISPORTS_KEY in .env or environment."
+            "API key not found. Set API_FOOTBALL_KEY, APISPORTS_KEY, or FOOTBALL_API_KEY in .env or environment."
         )
     return api_key
 
@@ -113,101 +117,81 @@ def fetch_matches(
     skip_plan_errors: bool = False,
 ) -> List[Dict[str, Any]]:
     logger = logging.getLogger("fetch_matches")
-    page = 1
     matches: List[Dict[str, Any]] = []
 
-    while True:
-        params: Dict[str, Any] = {
-            "league": league_id,
-            "season": season,
-            "page": page,
-        }
-        if from_date:
-            params["from"] = from_date
-        if to_date:
-            params["to"] = to_date
+    params: Dict[str, Any] = {
+        "league": league_id,
+        "season": season,
+    }
+    if from_date:
+        params["from"] = from_date
+    if to_date:
+        params["to"] = to_date
 
-        logger.debug(
-            "Requesting fixtures league=%s season=%s page=%s from=%s to=%s",
-            league_id,
-            season,
-            page,
-            from_date,
-            to_date,
+    logger.debug(
+        "Requesting fixtures league=%s season=%s from=%s to=%s",
+        league_id,
+        season,
+        from_date,
+        to_date,
+    )
+
+    response = session.get(
+        f"{API_BASE_URL}/fixtures",
+        headers={"x-apisports-key": api_key},
+        params=params,
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.error(
+            "API-Football HTTP error: %s %s",
+            response.status_code,
+            response.text,
         )
+        raise RuntimeError(
+            f"API-Football request failed with status {response.status_code}"
+        ) from exc
+    except requests.RequestException as exc:
+        logger.exception("API-Football request exception")
+        raise RuntimeError("Network error while fetching matches") from exc
 
-        response = session.get(
-            f"{API_BASE_URL}/fixtures",
-            headers={"x-apisports-key": api_key},
-            params=params,
-            timeout=DEFAULT_TIMEOUT,
-        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected API response: payload is not a JSON object")
 
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            logger.error(
-                "API-Football HTTP error: %s %s",
-                response.status_code,
-                response.text,
+    errors = payload.get("errors")
+    if errors:
+        logger.error("API-Football returned errors: %s", errors)
+        err_text = str(errors).lower()
+        # Se a resposta indicar limitação do plano (ex: Free plans do not have access),
+        # pule esta liga/temporada se o usuário tiver solicitado via flag.
+        if (
+            ("free plan" in err_text
+            or "free plans" in err_text
+            or "do not have access" in err_text
+            or "not have access" in err_text
+            or "access to this season" in err_text)
+            and skip_plan_errors
+        ):
+            logger.warning(
+                "Acesso negado por restrição de plano para league=%s season=%s: %s",
+                league_id,
+                season,
+                errors,
             )
-            raise RuntimeError(
-                f"API-Football request failed with status {response.status_code}"
-            ) from exc
-        except requests.RequestException as exc:
-            logger.exception("API-Football request exception")
-            raise RuntimeError("Network error while fetching matches") from exc
+            return []
 
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise RuntimeError("Unexpected API response: payload is not a JSON object")
+        # Senão, trate como erro fatal para que a execução pare e o usuário veja o problema.
+        raise RuntimeError("API-Football returned error payload")
 
-        errors = payload.get("errors")
-        if errors:
-            logger.error("API-Football returned errors: %s", errors)
-            err_text = str(errors).lower()
-            # Se a resposta indicar limitação do plano (ex: Free plans do not have access),
-            # pule esta liga/temporada se o usuário tiver solicitado via flag.
-            if (
-                ("free plan" in err_text
-                or "free plans" in err_text
-                or "do not have access" in err_text
-                or "not have access" in err_text
-                or "access to this season" in err_text)
-                and skip_plan_errors
-            ):
-                logger.warning(
-                    "Acesso negado por restrição de plano para league=%s season=%s: %s",
-                    league_id,
-                    season,
-                    errors,
-                )
-                return []
+    response_data = payload.get("response")
+    if response_data is None:
+        raise RuntimeError("API-Football response missing 'response' field")
 
-            # Senão, trate como erro fatal para que a execução pare e o usuário veja o problema.
-            raise RuntimeError("API-Football returned error payload")
-
-        response_data = payload.get("response")
-        if response_data is None:
-            raise RuntimeError("API-Football response missing 'response' field")
-
-        page_matches = [normalize_match(item) for item in response_data]
-        matches.extend(page_matches)
-
-        paging = payload.get("paging") or {}
-        current_page = paging.get("current", page)
-        total_pages = paging.get("total", page)
-        logger.debug(
-            "Fetched page %s/%s for league=%s, page matches=%s",
-            current_page,
-            total_pages,
-            league_id,
-            len(page_matches),
-        )
-
-        if current_page >= total_pages:
-            break
-        page += 1
+    matches.extend(normalize_match(item) for item in response_data)
 
     logger.info("Fetched %d matches for league %s season %s", len(matches), league_id, season)
     return matches
@@ -230,8 +214,10 @@ def normalize_match(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         "status": fixture.get("status", {}).get("short"),
         "home_team_id": teams.get("home", {}).get("id"),
         "home_team_name": teams.get("home", {}).get("name"),
+        "home_team": teams.get("home", {}).get("name"),
         "away_team_id": teams.get("away", {}).get("id"),
         "away_team_name": teams.get("away", {}).get("name"),
+        "away_team": teams.get("away", {}).get("name"),
         "home_goals": goals.get("home"),
         "away_goals": goals.get("away"),
         "winner": score.get("winner"),
@@ -253,6 +239,9 @@ def normalize_matches(matches: List[Dict[str, Any]]) -> pd.DataFrame:
 
     df = df.convert_dtypes()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    if "status" in df.columns:
+        df = df[df["status"].isin(["FT", "AET", "PEN"])]
+    df = df.dropna(subset=["date", "home_team", "away_team", "home_goals", "away_goals"])
     df = df.sort_values(by=["league_id", "season", "date", "fixture_id"])
     df = df.drop_duplicates(subset=["fixture_id"], keep="last")
     return df
@@ -267,7 +256,23 @@ def save_matches_to_csv(matches: pd.DataFrame, output_path: Path) -> None:
         logger.warning("Nenhum registro para salvar em %s", output_path)
         return
 
-    logger.info("Salvando %d partidas em %s", len(matches), output_path)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        existing = pd.read_csv(output_path)
+        matches = pd.concat([existing, matches], ignore_index=True, sort=False)
+
+    if "fixture_id" in matches.columns:
+        matches = matches.drop_duplicates(subset=["fixture_id"], keep="last")
+    else:
+        matches = matches.drop_duplicates(
+            subset=["date", "home_team", "away_team", "home_goals", "away_goals"],
+            keep="last",
+        )
+
+    if "date" in matches.columns:
+        matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
+        matches = matches.sort_values(["date", "home_team", "away_team"])
+
+    logger.info("Salvando %d partidas acumuladas em %s", len(matches), output_path)
     matches.to_csv(output_path, index=False, encoding="utf-8")
 
 

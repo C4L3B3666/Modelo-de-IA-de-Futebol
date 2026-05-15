@@ -66,6 +66,22 @@ def parse_arguments() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Nível de log para execução.",
     )
+    parser.add_argument(
+        "--use-predictor",
+        action="store_true",
+        help="Se presente, tenta usar a classe Predictor (modelos salvos em models/)",
+    )
+    parser.add_argument(
+        "--all-matches",
+        action="store_true",
+        help="Gera previsões para os confrontos presentes no CSV em vez de apenas um jogo.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Quantidade de jogos a exibir com --all-matches. Use 0 para todos.",
+    )
     return parser.parse_args()
 
 
@@ -145,6 +161,52 @@ def compute_outcome_probabilities(probabilities: pd.DataFrame) -> Dict[str, floa
     }
 
 
+def predict_match_summary(model: PoissonGoalModel, home_team: str, away_team: str, max_goals: int) -> Dict[str, object]:
+    home_expected, away_expected = model.predict_expected_goals(home_team, away_team)
+    probabilities = model.predict_score_probabilities(home_team, away_team, max_goals=max_goals)
+    outcome_prob = compute_outcome_probabilities(probabilities)
+    top_score = probabilities.iloc[0]
+    return {
+        "home_team": home_team,
+        "away_team": away_team,
+        "home_expected": home_expected,
+        "away_expected": away_expected,
+        "home_win": outcome_prob["Vitória casa"],
+        "draw": outcome_prob["Empate"],
+        "away_win": outcome_prob["Vitória fora"],
+        "top_score": f"{int(top_score['home_goals'])}-{int(top_score['away_goals'])}",
+        "top_score_prob": float(top_score["probability"]),
+    }
+
+
+def display_all_match_predictions(
+    model: PoissonGoalModel,
+    matches: pd.DataFrame,
+    max_goals: int,
+    limit: int,
+) -> None:
+    rows = matches.tail(limit).copy() if limit > 0 else matches.copy()
+    print("\nPrevisões para jogos do CSV:")
+    print("Casa | Fora | xG Casa | xG Fora | Casa | Empate | Fora | Placar")
+    print("-" * 92)
+    for _, row in rows.iterrows():
+        try:
+            summary = predict_match_summary(
+                model,
+                str(row["home_team"]),
+                str(row["away_team"]),
+                max_goals,
+            )
+        except KeyError:
+            continue
+        print(
+            f"{summary['home_team']} | {summary['away_team']} | "
+            f"{summary['home_expected']:.2f} | {summary['away_expected']:.2f} | "
+            f"{summary['home_win'] * 100:.1f}% | {summary['draw'] * 100:.1f}% | "
+            f"{summary['away_win'] * 100:.1f}% | {summary['top_score']}"
+        )
+
+
 def main() -> int:
     args = parse_arguments()
     setup_logging(args.log_level)
@@ -164,6 +226,10 @@ def main() -> int:
         away_goals_col="away_goals",
     )
     logger.info("Modelo Poisson ajustado com sucesso.")
+
+    if args.all_matches:
+        display_all_match_predictions(model, matches, args.max_goals, args.limit)
+        return 0
 
     home_team = args.home_team
     away_team = args.away_team
