@@ -173,6 +173,12 @@ class PoissonGoalModel:
 
         return strengths
 
+    def _get_team_strength(self, team_name: str) -> pd.Series:
+        """Retorna as forças calculadas para um time específico."""
+        if team_name not in self.team_strengths_.index:
+            raise KeyError(f"Time desconhecido para previsão: {team_name}")
+        return self.team_strengths_.loc[team_name]
+
     def _compute_home_advantage(self, avg_home_goals: float, avg_away_goals: float) -> float:
         """Calcula a vantagem de casa como razão entre as médias de gols."""
         if avg_away_goals <= 0:
