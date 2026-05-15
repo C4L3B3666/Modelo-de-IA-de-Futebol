@@ -1,1 +1,4 @@
-numpy>=1.26.0\npandas>=2.2.0\nscipy>=1.11.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.11.0
+matplotlib>=3.8.0
