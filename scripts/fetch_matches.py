@@ -1,21 +1,47 @@
+﻿"""Fetch real football match feeds from API-Football and save them as structured CSV and SQLite.
+
+This module is designed for professional ingestion:
+- loads API credentials from .env / environment variables
+- supports multiple leagues and seasons
+- deduplicates by fixture ID
+- saves a combined CSV to data/real_matches.csv
+- keeps a SQLite store for future expansion
+- includes robust API error handling and structured logs
+"""
+
+from __future__ import annotations
+
 import argparse
-import csv
 import logging
 import os
+import sys
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from models.database import DEFAULT_DB_PATH, connect_database, upsert_matches
+
 API_HOST = "v3.football.api-sports.io"
-API_BASE_URL = f"https://{API_HOST}/v3"
-DEFAULT_OUTPUT_DIR = Path("data/raw")
+API_BASE_URL = f"https://{API_HOST}"
+DEFAULT_OUTPUT_PATH = Path("data/real_matches.csv")
 DEFAULT_TIMEOUT = 10
+DEFAULT_LOG_LEVEL = "INFO"
 
 
-def setup_logging(level: str = "INFO") -> None:
+def load_environment() -> None:
+    load_dotenv()
+
+
+def setup_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -23,16 +49,31 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
-def load_api_key(cli_key: Optional[str]) -> str:
+def parse_league_ids(values: Optional[List[str]]) -> List[int]:
+    league_ids: List[int] = []
+    if not values:
+        return league_ids
+
+    for value in values:
+        if not value:
+            continue
+        for token in value.split(","):
+            token = token.strip()
+            if token:
+                league_ids.append(int(token))
+
+    return league_ids
+
+
+def get_api_key(cli_key: Optional[str]) -> str:
     if cli_key:
         return cli_key
 
     api_key = os.getenv("API_FOOTBALL_KEY") or os.getenv("APISPORTS_KEY")
     if not api_key:
         raise RuntimeError(
-            "API key not found. Set the API_FOOTBALL_KEY environment variable or pass --api-key."
+            "API key not found. Set API_FOOTBALL_KEY or APISPORTS_KEY in .env or environment."
         )
-
     return api_key
 
 
@@ -47,11 +88,19 @@ def create_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
-    session.headers.update({
-        "x-apisports-host": API_HOST,
-        "Accept": "application/json",
-    })
+    session.headers.update(
+        {
+            "x-apisports-host": API_HOST,
+            "Accept": "application/json",
+        }
+    )
     return session
+
+
+def parse_iso_date(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return date.fromisoformat(value).isoformat()
 
 
 def fetch_matches(
@@ -59,63 +108,114 @@ def fetch_matches(
     api_key: str,
     league_id: int,
     season: int,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     logger = logging.getLogger("fetch_matches")
-    matches: List[Dict[str, Any]] = []
     page = 1
+    matches: List[Dict[str, Any]] = []
 
     while True:
-        logger.info("Fetching matches for league=%s season=%s page=%s", league_id, season, page)
+        params: Dict[str, Any] = {
+            "league": league_id,
+            "season": season,
+            "page": page,
+        }
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+
+        logger.debug(
+            "Requesting fixtures league=%s season=%s page=%s from=%s to=%s",
+            league_id,
+            season,
+            page,
+            from_date,
+            to_date,
+        )
+
         response = session.get(
             f"{API_BASE_URL}/fixtures",
             headers={"x-apisports-key": api_key},
-            params={"league": league_id, "season": season, "page": page},
+            params=params,
             timeout=DEFAULT_TIMEOUT,
         )
 
         try:
             response.raise_for_status()
-        except requests.HTTPError as error:
+        except requests.HTTPError as exc:
             logger.error(
-                "API request failed: %s - %s",
+                "API-Football HTTP error: %s %s",
                 response.status_code,
                 response.text,
             )
-            raise RuntimeError("Falha na requisição à API-Football") from error
+            raise RuntimeError(
+                f"API-Football request failed with status {response.status_code}"
+            ) from exc
+        except requests.RequestException as exc:
+            logger.exception("API-Football request exception")
+            raise RuntimeError("Network error while fetching matches") from exc
 
         payload = response.json()
         if not isinstance(payload, dict):
-            raise RuntimeError("Resposta inesperada da API: formato inválido")
+            raise RuntimeError("Unexpected API response: payload is not a JSON object")
 
-        if payload.get("errors"):
-            logger.error("API returned errors: %s", payload["errors"])
-            raise RuntimeError("A API retornou erros ao buscar partidas")
+        errors = payload.get("errors")
+        if errors:
+            logger.error("API-Football returned errors: %s", errors)
+            err_text = str(errors).lower()
+            # Se a resposta indicar limitação do plano (ex: Free plans do not have access),
+            # pule esta liga/temporada em vez de abortar toda a execução.
+            if (
+                "free plan" in err_text
+                or "free plans" in err_text
+                or "do not have access" in err_text
+                or "not have access" in err_text
+                or "access to this season" in err_text
+            ):
+                logger.warning(
+                    "Acesso negado por restrição de plano para league=%s season=%s: %s",
+                    league_id,
+                    season,
+                    errors,
+                )
+                return []
+
+            raise RuntimeError("API-Football returned error payload")
 
         response_data = payload.get("response")
         if response_data is None:
-            raise RuntimeError("Resposta da API não contém campo 'response'")
+            raise RuntimeError("API-Football response missing 'response' field")
 
-        matches.extend([normalize_match(item) for item in response_data])
+        page_matches = [normalize_match(item) for item in response_data]
+        matches.extend(page_matches)
 
         paging = payload.get("paging") or {}
         current_page = paging.get("current", page)
         total_pages = paging.get("total", page)
+        logger.debug(
+            "Fetched page %s/%s for league=%s, page matches=%s",
+            current_page,
+            total_pages,
+            league_id,
+            len(page_matches),
+        )
 
         if current_page >= total_pages:
             break
-
         page += 1
 
-    logger.info("Total matches fetched: %s", len(matches))
+    logger.info("Fetched %d matches for league %s season %s", len(matches), league_id, season)
     return matches
 
 
 def normalize_match(match_payload: Dict[str, Any]) -> Dict[str, Any]:
-    fixture = match_payload.get("fixture", {})
-    league = match_payload.get("league", {})
-    teams = match_payload.get("teams", {})
-    goals = match_payload.get("goals", {})
-    score = match_payload.get("score", {})
+    fixture = match_payload.get("fixture", {}) or {}
+    league = match_payload.get("league", {}) or {}
+    teams = match_payload.get("teams", {}) or {}
+    goals = match_payload.get("goals", {}) or {}
+    score = match_payload.get("score", {}) or {}
 
     return {
         "fixture_id": fixture.get("id"),
@@ -131,7 +231,7 @@ def normalize_match(match_payload: Dict[str, Any]) -> Dict[str, Any]:
         "away_team_name": teams.get("away", {}).get("name"),
         "home_goals": goals.get("home"),
         "away_goals": goals.get("away"),
-        "winner": match_payload.get("score", {}).get("winner"),
+        "winner": score.get("winner"),
         "halftime_home": score.get("halftime", {}).get("home"),
         "halftime_away": score.get("halftime", {}).get("away"),
         "fulltime_home": score.get("fulltime", {}).get("home"),
@@ -143,111 +243,202 @@ def normalize_match(match_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def save_matches_to_csv(matches: List[Dict[str, Any]], output_path: Path) -> None:
+def normalize_matches(matches: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(matches)
+    if df.empty:
+        return df
+
+    df = df.convert_dtypes()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.sort_values(by=["league_id", "season", "date", "fixture_id"])
+    df = df.drop_duplicates(subset=["fixture_id"], keep="last")
+    return df
+
+
+def save_matches_to_csv(matches: pd.DataFrame, output_path: Path) -> None:
     logger = logging.getLogger("fetch_matches")
+    output_path = build_output_path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not matches:
-        logger.warning("Nenhuma partida para salvar em %s", output_path)
+    if matches.empty:
+        logger.warning("Nenhum registro para salvar em %s", output_path)
         return
 
-    fieldnames = list(matches[0].keys())
-    logger.info("Gravando %s partidas em %s", len(matches), output_path)
-
-    try:
-        with output_path.open("w", encoding="utf-8", newline="") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(matches)
-    except OSError as error:
-        logger.error("Falha ao salvar CSV: %s", error)
-        raise
+    logger.info("Salvando %d partidas em %s", len(matches), output_path)
+    matches.to_csv(output_path, index=False, encoding="utf-8")
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Coleta partidas de futebol da API-Football e salva em CSV. "
-            "Use --league-id e --season ou configure as variáveis de ambiente "
-            "API_FOOTBALL_LEAGUE_ID e API_FOOTBALL_SEASON."
+            "Coleta partidas reais da API-Football e salva uma exportação CSV. "
+            "Use .env para carregar API_KEY e configure liga/temporada conforme necessário."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
-        "--league-id",
-        type=int,
-        default=os.getenv("API_FOOTBALL_LEAGUE_ID"),
-        help="ID da liga no API-Football (por exemplo, 39 para Premier League).",
+        "--league-ids",
+        action="append",
+        default=None,
+        help=(
+            "Identificadores de liga separados por vírgula ou em múltiplos argumentos. "
+            "Exemplo: --league-ids 39,140"
+        ),
     )
     parser.add_argument(
         "--season",
         type=int,
         default=os.getenv("API_FOOTBALL_SEASON"),
-        help="Temporada que será consultada (por exemplo, 2024).",
+        help="Temporada a ser consultada (por exemplo, 2024).",
+    )
+    parser.add_argument(
+        "--from-date",
+        type=str,
+        default=os.getenv("API_FOOTBALL_FROM_DATE"),
+        help="Data inicial no formato YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--to-date",
+        type=str,
+        default=os.getenv("API_FOOTBALL_TO_DATE"),
+        help="Data final no formato YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="Atualiza o intervalo diário em torno da data atual.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Caminho do arquivo CSV de saída. Se for pasta, o nome será gerado automaticamente.",
+        default=DEFAULT_OUTPUT_PATH,
+        help="Caminho do CSV de saída ou diretório onde será gravado real_matches.csv.",
     )
     parser.add_argument(
         "--api-key",
         type=str,
         default=None,
-        help="Chave de API-Football. Alternativamente, use a variável de ambiente API_FOOTBALL_KEY.",
+        help="Chave da API-Football. Alternativamente, use .env e API_FOOTBALL_KEY.",
     )
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default=os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL),
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Nível de log para execução.",
     )
 
     args = parser.parse_args()
-    if args.league_id is None:
-        parser.error(
-            "argument --league-id is required (or set API_FOOTBALL_LEAGUE_ID)"
-        )
-    if args.season is None:
-        parser.error(
-            "argument --season is required (or set API_FOOTBALL_SEASON)"
-        )
+    league_ids = parse_league_ids(args.league_ids)
+    if not league_ids:
+        env_leagues = os.getenv("API_FOOTBALL_LEAGUE_IDS")
+        league_ids = parse_league_ids([env_leagues]) if env_leagues else []
 
+    if not league_ids:
+        parser.error("Obrigatório informar --league-ids ou API_FOOTBALL_LEAGUE_IDS.")
+
+    if args.season is None:
+        parser.error("Obrigatório informar --season ou API_FOOTBALL_SEASON.")
+
+    args.league_ids = sorted(set(league_ids))
     return args
 
 
-def build_output_path(base_output: Path, league_id: int, season: int) -> Path:
-    if base_output.is_dir() or str(base_output).endswith("/") or str(base_output).endswith('\\'):
-        filename = f"matches_league_{league_id}_{season}.csv"
-        return base_output / filename
+def build_output_path(base_output: Path) -> Path:
+    if base_output.is_dir():
+        return base_output / DEFAULT_OUTPUT_PATH.name
 
-    if base_output.suffix.lower() != ".csv":
-        base_output = base_output.with_suffix(".csv")
+    if base_output.suffix == "":
+        return base_output.with_suffix(".csv")
 
     return base_output
 
 
+def build_date_range(args: argparse.Namespace) -> tuple[Optional[str], Optional[str]]:
+    if args.daily:
+        today = date.today()
+        return (
+            (today - timedelta(days=3)).isoformat(),
+            (today + timedelta(days=14)).isoformat(),
+        )
+
+    return parse_iso_date(args.from_date), parse_iso_date(args.to_date)
+
+
 def main() -> int:
+    load_environment()
     args = parse_arguments()
     setup_logging(args.log_level)
     logger = logging.getLogger("fetch_matches")
-    logger.info("Iniciando coleta de partidas: league=%s season=%s", args.league_id, args.season)
+
+    from_date, to_date = build_date_range(args)
+    logger.info(
+        "Iniciando ingestão: leagues=%s season=%s from=%s to=%s",
+        args.league_ids,
+        args.season,
+        from_date,
+        to_date,
+    )
+
+    api_key = get_api_key(args.api_key)
+    session = create_session()
+    connection = connect_database(DEFAULT_DB_PATH)
+
+    all_frames: List[pd.DataFrame] = []
+    total_saved = 0
 
     try:
-        api_key = load_api_key(args.api_key)
-        session = create_session()
-        matches = fetch_matches(session, api_key, args.league_id, args.season)
+        for league_id in args.league_ids:
+            try:
+                league_matches = fetch_matches(
+                    session,
+                    api_key,
+                    league_id,
+                    args.season,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            except RuntimeError as exc:
+                logger.error("Erro ao buscar partidas para liga %s: %s", league_id, exc)
+                continue
 
-        output_path = build_output_path(args.output, args.league_id, args.season)
-        save_matches_to_csv(matches, output_path)
+            if not league_matches:
+                logger.warning("Liga %s retornou 0 partidas", league_id)
+                continue
 
-        logger.info("Coleta finalizada com sucesso.")
+            df = normalize_matches(league_matches)
+            if df.empty:
+                logger.warning("Liga %s não gerou um DataFrame válido", league_id)
+                continue
+
+            saved = upsert_matches(connection, df.to_dict("records"))
+            total_saved += saved
+            all_frames.append(df)
+            logger.info(
+                "Liga %s: %s partidas carregadas, %s registros salvos/atualizados.",
+                league_id,
+                len(df),
+                saved,
+            )
+
+        if all_frames:
+            combined = pd.concat(all_frames, ignore_index=True)
+            combined = combined.drop_duplicates(subset=["fixture_id"])
+            save_matches_to_csv(combined, args.output)
+        else:
+            logger.warning("Nenhuma partida processada; nenhum CSV será gerado.")
+
+        logger.info(
+            "Ingestão completa. Ligas processadas=%s, registros únicos=%s, registros salvos=%s.",
+            len(args.league_ids),
+            sum(len(frame) for frame in all_frames),
+            total_saved,
+        )
         return 0
-    except Exception as error:
-        logger.exception("Erro durante a coleta de partidas: %s", error)
+
+    except Exception as exc:
+        logger.exception("Falha ao executar ingestão de partidas: %s", exc)
         return 1
 
 
