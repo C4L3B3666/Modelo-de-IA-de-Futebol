@@ -110,6 +110,7 @@ def fetch_matches(
     season: int,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    skip_plan_errors: bool = False,
 ) -> List[Dict[str, Any]]:
     logger = logging.getLogger("fetch_matches")
     page = 1
@@ -166,13 +167,14 @@ def fetch_matches(
             logger.error("API-Football returned errors: %s", errors)
             err_text = str(errors).lower()
             # Se a resposta indicar limitação do plano (ex: Free plans do not have access),
-            # pule esta liga/temporada em vez de abortar toda a execução.
+            # pule esta liga/temporada se o usuário tiver solicitado via flag.
             if (
-                "free plan" in err_text
+                ("free plan" in err_text
                 or "free plans" in err_text
                 or "do not have access" in err_text
                 or "not have access" in err_text
-                or "access to this season" in err_text
+                or "access to this season" in err_text)
+                and skip_plan_errors
             ):
                 logger.warning(
                     "Acesso negado por restrição de plano para league=%s season=%s: %s",
@@ -182,6 +184,7 @@ def fetch_matches(
                 )
                 return []
 
+            # Senão, trate como erro fatal para que a execução pare e o usuário veja o problema.
             raise RuntimeError("API-Football returned error payload")
 
         response_data = payload.get("response")
@@ -329,6 +332,16 @@ def parse_arguments() -> argparse.Namespace:
         help="Nível de log para execução.",
     )
 
+    parser.add_argument(
+        "--skip-plan-errors",
+        action="store_true",
+        default=False,
+        help=(
+            "Quando definido, fará com que a execução pule ligas/temporadas bloqueadas "
+            "pelo plano (ex.: mensagem 'Free plans do not have access') em vez de abortar."
+        ),
+    )
+
     args = parser.parse_args()
     league_ids = parse_league_ids(args.league_ids)
     if not league_ids:
@@ -398,6 +411,7 @@ def main() -> int:
                     args.season,
                     from_date=from_date,
                     to_date=to_date,
+                    skip_plan_errors=args.skip_plan_errors,
                 )
             except RuntimeError as exc:
                 logger.error("Erro ao buscar partidas para liga %s: %s", league_id, exc)

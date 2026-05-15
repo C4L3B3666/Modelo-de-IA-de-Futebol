@@ -77,15 +77,43 @@ def load_match_data(path: Path) -> pd.DataFrame:
         else:
             raise FileNotFoundError(f"Arquivo de dados não encontrado: {path}")
 
-    df = pd.read_csv(path)
+    # Checar se o arquivo está vazio para evitar erro de parser do pandas
+    try:
+        if path.stat().st_size == 0:
+            raise ValueError(
+                f"Arquivo de dados encontrado, mas está vazio: {path}. Execute scripts/fetch_matches.py para popular o CSV ou passe outro arquivo via --data."
+            )
+    except OSError:
+        # Problema ao acessar metadados do arquivo; deixamos o pandas lançar erro apropriado
+        pass
+
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        raise ValueError(
+            f"Arquivo CSV inválido ou vazio: {path}. Execute scripts/fetch_matches.py para popular o CSV ou use outro arquivo com partidas reais."
+        )
+
+    # Normaliza nomes de colunas comuns vindos do ingestor real
+    df_work = df.copy()
+    # Mapear home/away name se necessário
+    if "home_team" not in df_work.columns and "home_team_name" in df_work.columns:
+        df_work["home_team"] = df_work["home_team_name"]
+    if "away_team" not in df_work.columns and "away_team_name" in df_work.columns:
+        df_work["away_team"] = df_work["away_team_name"]
+
     required_columns = ["home_team", "away_team", "home_goals", "away_goals"]
-    missing = [column for column in required_columns if column not in df.columns]
+    missing = [column for column in required_columns if column not in df_work.columns]
     if missing:
         raise ValueError(
             f"CSV de partidas falta as seguintes colunas obrigatórias: {missing}"
         )
 
-    return df
+    # Garantir tipos adequados
+    df_work["home_goals"] = pd.to_numeric(df_work["home_goals"], errors="coerce").fillna(0).astype(int)
+    df_work["away_goals"] = pd.to_numeric(df_work["away_goals"], errors="coerce").fillna(0).astype(int)
+
+    return df_work
 
 
 def format_probability(value: float) -> str:
@@ -127,7 +155,14 @@ def main() -> int:
     logger.info("Dados carregados: %d partidas", len(matches))
 
     model = PoissonGoalModel(max_goals=args.max_goals)
-    model.fit(matches)
+    # Ajustar modelo com nomes de colunas padronizados
+    model.fit(
+        matches,
+        home_team_col="home_team",
+        away_team_col="away_team",
+        home_goals_col="home_goals",
+        away_goals_col="away_goals",
+    )
     logger.info("Modelo Poisson ajustado com sucesso.")
 
     home_team = args.home_team
@@ -142,16 +177,22 @@ def main() -> int:
             away_team,
         )
 
-    home_expected, away_expected = model.predict_expected_goals(
-        home_team, away_team
-    )
-    probabilities = model.predict_score_probabilities(
-        home_team, away_team, max_goals=args.max_goals
-    )
+    try:
+        home_expected, away_expected = model.predict_expected_goals(home_team, away_team)
+        probabilities = model.predict_score_probabilities(
+            home_team, away_team, max_goals=args.max_goals
+        )
+    except KeyError as exc:
+        logger.error("Erro de previsão: %s", exc)
+        teams = sorted(model.get_team_strengths().index.tolist())
+        print("Time não encontrado para previsão. Times disponíveis (amostra):")
+        for t in teams[:40]:
+            print("  ", t)
+        return 2
 
     print("\nPrevisão para:")
-    print(f"  Casa : {args.home_team}")
-    print(f"  Fora : {args.away_team}")
+    print(f"  Casa : {home_team}")
+    print(f"  Fora : {away_team}")
     print(f"  Gols esperados (casa) : {home_expected:.3f}")
     print(f"  Gols esperados (fora) : {away_expected:.3f}")
 
